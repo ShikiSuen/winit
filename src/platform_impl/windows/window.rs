@@ -382,6 +382,12 @@ impl Window {
     #[cfg(feature = "rwh_06")]
     #[inline]
     pub fn raw_window_handle_rwh_06(&self) -> Result<rwh_06::RawWindowHandle, rwh_06::HandleError> {
+        // If we aren't in the GUI thread, we can't return the window.
+        if !self.thread_executor.in_event_loop_thread() {
+            tracing::error!("tried to access window handle outside of the main thread");
+            return Err(rwh_06::HandleError::Unavailable);
+        }
+
         let mut window_handle = rwh_06::Win32WindowHandle::new(unsafe {
             // SAFETY: Handle will never be zero.
             std::num::NonZeroIsize::new_unchecked(self.window)
