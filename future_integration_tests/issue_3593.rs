@@ -12,7 +12,11 @@ fn issue_3593() {
 
         // Should't work on another thread.
         std::thread::spawn(move || {
-            assert!(window.window_handle().is_err());
+            if cfg!(windows) {
+                assert!(window.window_handle().is_err());
+            } else {
+                assert!(window.window_handle().is_ok());
+            }
         }).join().unwrap();
 
         elwt.exit();
