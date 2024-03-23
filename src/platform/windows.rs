@@ -106,7 +106,7 @@ pub enum CornerPreference {
 }
 
 /// A wrapper around a [`Window`] that ignores thread-specific window handle limitations.
-/// 
+///
 /// See [`WindowBorrowExtWindows::any_thread`] for more information.
 #[derive(Debug)]
 pub struct AnyThread<W>(W);
@@ -155,9 +155,7 @@ impl<W: Borrow<Window>> std::ops::Deref for AnyThread<W> {
 impl<W: Borrow<Window>> rwh_06::HasWindowHandle for AnyThread<W> {
     fn window_handle(&self) -> Result<rwh_06::WindowHandle<'_>, rwh_06::HandleError> {
         // SAFETY: The top level user has asserted this is only used safely.
-        unsafe {
-            self.get_ref().window_handle_any_thread()
-        }
+        unsafe { self.get_ref().window_handle_any_thread() }
     }
 }
 
@@ -321,9 +319,9 @@ pub trait WindowExtWindows {
     /// However in some cases you may already know that you are using the window handle for
     /// operations that are guaranteed to be thread-safe. In which case this function aims
     /// to provide an escape hatch so these functions are still accessible from other threads.
-    /// 
+    ///
     /// # Safety
-    /// 
+    ///
     /// It is the responsibility of the user to only pass the window handle into thread-safe
     /// Win32 APIs.
     ///
@@ -425,29 +423,29 @@ impl WindowExtWindows for Window {
 }
 
 /// Additional methods for anything that dereference to [`Window`].
-/// 
+///
 /// [`Window`]: crate::window::Window
-pub trait WindowBorrowExtWindows : Borrow<Window> + Sized {
+pub trait WindowBorrowExtWindows: Borrow<Window> + Sized {
     /// Create an object that allows accessing the inner window handle in a thread-unsafe way.
-    /// 
+    ///
     /// It is possible to call [`window_handle_any_thread`] to get around Windows's thread
     /// affinity limitations. However, it may be desired to pass the [`Window`] into something
     /// that requires the [`HasWindowHandle`] trait, while ignoring thread affinity limitations.
-    /// 
+    ///
     /// This function wraps anything that implements `Borrow<Window>` into a structure that
     /// uses the inner window handle as a mean of implementing [`HasWindowHandle`]. It wraps
     /// `Window`, `&Window`, `Arc<Window>`, and other reference types.
-    /// 
+    ///
     /// # Safety
-    /// 
+    ///
     /// It is the responsibility of the user to only pass the window handle into thread-safe
     /// Win32 APIs.
-    /// 
+    ///
     /// [`window_handle_any_thread`]: WindowExtWindows::window_handle_any_thread
     /// [`Window`]: crate::window::Window
     /// [`HasWindowHandle`]: rwh_06::HasWindowHandle
     unsafe fn any_thread(self) -> AnyThread<Self> {
-        AnyThread(self) 
+        AnyThread(self)
     }
 }
 
