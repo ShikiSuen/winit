@@ -248,6 +248,57 @@ pub trait WindowExtWindows {
     ///
     /// Supported starting with Windows 11 Build 22000.
     fn set_corner_preference(&self, preference: CornerPreference);
+
+    /// Get the raw window handle for this [`Window`] without checking for thread affinity.
+    ///
+    /// Window handles in Win32 have a property called "thread affinity" that ties them to their
+    /// origin thread. Some operations can only happen on the window's origin thread, while others
+    /// can be called from any thread. For example, [`SetWindowSubclass`] is not thread safe while
+    /// [`GetDC`] is thread safe.
+    ///
+    /// In Rust terms, the window handle is `Send` sometimes but `!Send` other times.
+    ///
+    /// Therefore, in order to avoid confusing threading errors, [`Window`] only returns the
+    /// window handle when the [`window_handle`] function is called from the thread that created
+    /// the window. In other cases, it returns an [`Unavailable`] error.
+    ///
+    /// However in some cases you may already know that you are using the window handle for
+    /// operations that are guaranteed to be thread-safe. In which case this function aims
+    /// to provide an escape hatch so these functions are still accessible from other threads.
+    ///
+    /// [`SetWindowSubclass`]: https://learn.microsoft.com/en-us/windows/win32/api/commctrl/nf-commctrl-setwindowsubclass
+    /// [`GetDC`]: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getdc
+    /// [`Window`]: crate::window::Window
+    /// [`window_handle`]: https://docs.rs/raw-window-handle/latest/raw_window_handle/trait.HasWindowHandle.html#tymethod.window_handle
+    /// [`Unavailable`]: https://docs.rs/raw-window-handle/latest/raw_window_handle/enum.HandleError.html#variant.Unavailable
+    ///
+    /// ## Example
+    ///
+    /// ```no_run
+    /// # use winit::window::Window;
+    /// # fn scope(window: Window) {
+    /// use std::thread;
+    /// use winit::platform::windows::WindowExtWindows;
+    /// use winit::raw_window_handle::HasWindowHandle;
+    ///
+    /// // We can get the window handle on the current thread.
+    /// let handle = window.window_handle().unwrap();
+    ///
+    /// // However, on another thread, we can't!
+    /// thread::spawn(move || {
+    ///     assert!(window.window_handle().is_err());
+    ///
+    ///     // We can use this function as an escape hatch.
+    ///     let handle = unsafe {
+    ///         window.window_handle_any_thread().unwrap()
+    ///     };
+    /// });
+    /// # }
+    /// ```
+    #[cfg(feature = "rwh_06")]
+    unsafe fn window_handle_any_thread(
+        &self,
+    ) -> Result<rwh_06::WindowHandle<'_>, rwh_06::HandleError>;
 }
 
 impl WindowExtWindows for Window {
@@ -297,6 +348,18 @@ impl WindowExtWindows for Window {
     #[inline]
     fn set_corner_preference(&self, preference: CornerPreference) {
         self.window.set_corner_preference(preference)
+    }
+
+    #[cfg(feature = "rwh_06")]
+    unsafe fn window_handle_any_thread(
+        &self,
+    ) -> Result<rwh_06::WindowHandle<'_>, rwh_06::HandleError> {
+        unsafe {
+            let handle = self.window.rwh_06_no_thread_check()?;
+
+            // SAFETY: The handle is valid in this context.
+            Ok(rwh_06::WindowHandle::borrow_raw(handle))
+        }
     }
 }
 
