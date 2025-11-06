@@ -15,6 +15,7 @@ use objc2_foundation::{
     NSMutableAttributedString, NSNotFound, NSNotificationCenter, NSObject, NSObjectProtocol,
     NSPoint, NSRange, NSRect, NSSize, NSString, NSUInteger,
 };
+use smol_str::SmolStr;
 
 use super::app_state::ApplicationDelegate;
 use super::cursor::{default_cursor, invisible_cursor};
@@ -42,6 +43,17 @@ impl Default for CursorState {
     fn default() -> Self {
         Self { visible: true, cursor: default_cursor() }
     }
+}
+
+/// Bookkeeping for a raw-character KeyboardInput that was queued.
+/// Used by insertText to detect when the same character is being sent as both
+/// a raw event and an IME commit, preventing duplicate delivery.
+#[derive(Debug)]
+struct PendingRawCharacter {
+    /// Serial of the key event that produced this raw character.
+    serial: u64,
+    /// Raw character text captured from `KeyEvent.text`.
+    text: SmolStr,
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Copy, Default)]
@@ -134,11 +146,28 @@ pub struct ViewState {
     marked_text: RefCell<Retained<NSMutableAttributedString>>,
     accepts_first_mouse: bool,
 
+    /// Monotonic counter incremented per keyDown/keyUp; groups raw text and IME handling within
+    /// the same runloop turn.
+    current_event_serial: Cell<u64>,
+    /// Serial of the last `NSEvent` that was handed to `NSTextInputContext::handleEvent`.
+    last_handled_event_serial: Cell<u64>,
+    /// Raw-character events queued for delivery; used to drop them if an IME Commit disagrees.
+    pending_raw_characters: RefCell<Vec<PendingRawCharacter>>,
+
     // Weak reference because the window keeps a strong reference to the view
     _ns_window: WeakId<WinitWindow>,
 
     /// The state of the `Option` as `Alt`.
     option_as_alt: Cell<OptionAsAlt>,
+
+    /// Suppress the next character-bearing keyUp after an IME commit.
+    suppress_next_keyup_char: Cell<bool>,
+
+    /// True while handling keyUp; used to filter stray insertText from keyUp.
+    handling_keyup: Cell<bool>,
+
+    /// Serial of the last IME commit; used to drop stray ASCII from the same key cycle.
+    last_commit_serial: Cell<u64>,
 }
 
 declare_class!(
@@ -348,7 +377,11 @@ declare_class!(
         #[method_id(validAttributesForMarkedText)]
         fn valid_attributes_for_marked_text(&self) -> Retained<NSArray<NSAttributedStringKey>> {
             trace_scope!("validAttributesForMarkedText");
-            NSArray::new()
+            // Advertise the winit version so IME clients can identify us.
+            let client_identifier =
+                NSString::from_str(concat!("_rust_winit_", env!("CARGO_PKG_VERSION")));
+            let vec = vec![client_identifier];
+            NSArray::from_vec(vec)
         }
 
         #[method_id(attributedSubstringForProposedRange:actualRange:)]
@@ -401,11 +434,48 @@ declare_class!(
 
             let is_control = string.chars().next().is_some_and(|c| c.is_control());
 
+            // If we're in keyUp handling, drop stray ASCII single characters some IMEs/apps send.
+            if self.ivars().handling_keyup.get() && string.is_ascii() && string.chars().count() == 1
+            {
+                return;
+            }
+            // Drop a stray ASCII '.' arriving on keyUp for the same key cycle as a commit.
+            let current_serial = self.ivars().current_event_serial.get();
+            if self.ivars().last_commit_serial.get() == current_serial && string == "." {
+                return;
+            }
+
+            // If insertText equals the pending raw character, treat it as plain typing and avoid
+            // IME commit.
+            let mut same_as_pending = false;
+            {
+                let pending = self.ivars().pending_raw_characters.borrow();
+                if let Some(entry) = pending.last() {
+                    if entry.text.as_str() == string {
+                        same_as_pending = true;
+                    }
+                }
+            }
+
+            if same_as_pending {
+                // Not an IME transformation; let the pending raw character deliver.
+                return;
+            }
+
             // Commit only if we have marked text.
             if unsafe { self.hasMarkedText() } && self.is_ime_enabled() && !is_control {
                 self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
-                self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
+                self.queue_event(WindowEvent::Ime(Ime::Commit(string.clone())));
                 self.ivars().ime_state.set(ImeState::Committed);
+
+                // Drop conflicting raw characters from the same key event.
+                self.drop_conflicting_raw_characters(&string);
+
+                // Mark this serial as having committed so keyUp can filter stray ASCII.
+                self.ivars().last_commit_serial.set(current_serial);
+
+                // Suppress a character-bearing keyUp for this commit.
+                self.ivars().suppress_next_keyup_char.set(true);
             }
         }
 
@@ -435,6 +505,10 @@ declare_class!(
         #[method(keyDown:)]
         fn key_down(&self, event: &NSEvent) {
             trace_scope!("keyDown:");
+
+            // Begin a new serial for this key event.
+            self.begin_key_event();
+
             {
                 let mut prev_input_source = self.ivars().input_source.borrow_mut();
                 let current_input_source = self.current_input_source();
@@ -450,6 +524,9 @@ declare_class!(
             let old_ime_state = self.ivars().ime_state.get();
             self.ivars().forward_key_to_app.set(false);
             let event = replace_event(event, self.option_as_alt());
+
+            // Let IME observe the event first via handleEvent.
+            let _ime_consumed_event = self.handle_text_input_event(&event);
 
             // The `interpretKeyEvents` function might call
             // `setMarkedText`, `insertText`, and `doCommandBySelector`.
@@ -481,13 +558,23 @@ declare_class!(
                 _ => old_ime_state != self.ivars().ime_state.get(),
             };
 
-            if !had_ime_input || self.ivars().forward_key_to_app.get() {
-                let key_event = create_key_event(&event, true, unsafe { event.isARepeat() });
-                self.queue_event(WindowEvent::KeyboardInput {
-                    device_id: DEVICE_ID,
-                    event: key_event,
-                    is_synthetic: false,
-                });
+            let key_event = create_key_event(&event, true, unsafe { event.isARepeat() });
+
+            // Decide whether to send raw character input.
+            let send_raw = if self.ivars().forward_key_to_app.get() {
+                true
+            } else if self.is_ime_enabled() {
+                // Allow non-text keys through, and always pass through when Ctrl/Command is held
+                // for shortcuts.
+                let mods = self.ivars().modifiers.get().state();
+                key_event.text.is_none()
+                    || mods.intersects(ModifiersState::CONTROL | ModifiersState::SUPER)
+            } else {
+                !had_ime_input
+            };
+
+            if send_raw {
+                self.queue_keyboard_input_event(key_event, false);
             }
         }
 
@@ -495,19 +582,40 @@ declare_class!(
         fn key_up(&self, event: &NSEvent) {
             trace_scope!("keyUp:");
 
+            // Mark that we're handling keyUp.
+            self.ivars().handling_keyup.set(true);
+
             let event = replace_event(event, self.option_as_alt());
+
+            // Let IME observe the event.
+            let ime_consumed_event = self.handle_text_input_event(&event);
+
+            // interpretKeyEvents may call insertText for keyUp in some IMEs.
+            if self.ivars().ime_allowed.get() {
+                let events_for_nsview = NSArray::from_slice(&[&*event]);
+                unsafe { self.interpretKeyEvents(&events_for_nsview) };
+            }
+
+            self.ivars().handling_keyup.set(false);
             self.update_modifiers(&event, false);
 
-            // We want to send keyboard input when we are currently in the ground state.
-            if matches!(
-                self.ivars().ime_state.get(),
-                ImeState::Ground | ImeState::Disabled
-            ) {
-                self.queue_event(WindowEvent::KeyboardInput {
-                    device_id: DEVICE_ID,
-                    event: create_key_event(&event, false, false),
-                    is_synthetic: false,
-                });
+            let key_event = create_key_event(&event, false, false);
+            let is_char_key = key_event.text.is_some();
+
+            // Reset the suppress flag if this is the character-bearing keyUp we were waiting for.
+            if is_char_key && self.ivars().suppress_next_keyup_char.get() {
+                self.ivars().suppress_next_keyup_char.set(false);
+                return;
+            }
+
+            // Route keyUp: forward non-character releases when IME is enabled and didn't consume,
+            // or when Ctrl/Command is held (shortcuts).
+            let mods = self.ivars().modifiers.get().state();
+            if !self.is_ime_enabled()
+                || (!is_char_key && !ime_consumed_event)
+                || mods.intersects(ModifiersState::CONTROL | ModifiersState::SUPER)
+            {
+                self.queue_keyboard_input_event(key_event, false);
             }
         }
 
@@ -799,8 +907,14 @@ impl WinitView {
             forward_key_to_app: Default::default(),
             marked_text: Default::default(),
             accepts_first_mouse,
+            current_event_serial: Default::default(),
+            last_handled_event_serial: Default::default(),
+            pending_raw_characters: Default::default(),
             _ns_window: WeakId::new(&window.retain()),
             option_as_alt: Cell::new(option_as_alt),
+            suppress_next_keyup_char: Default::default(),
+            handling_keyup: Default::default(),
+            last_commit_serial: Default::default(),
         });
         let this: Retained<Self> = unsafe { msg_send_id![super(this), init] };
 
@@ -1077,6 +1191,68 @@ impl WinitView {
             device_id: DEVICE_ID,
             position: view_point.to_physical(self.scale_factor()),
         });
+    }
+
+    /// Queue a KeyboardInput for delivery.
+    ///
+    /// Note: In v0.30.9, we don't have the deferred event mechanism from newer versions,
+    /// so we queue events immediately. The IME filtering logic in insertText will help
+    /// prevent duplicate character delivery by checking pending_raw_characters.
+    fn queue_keyboard_input_event(&self, key_event: KeyEvent, is_synthetic: bool) {
+        // Associate this event with the current key event serial.
+        let serial = self.ivars().current_event_serial.get();
+
+        // Track character-bearing events so insertText can detect duplicates.
+        if let Some(text) = &key_event.text {
+            self.ivars()
+                .pending_raw_characters
+                .borrow_mut()
+                .push(PendingRawCharacter { serial, text: text.clone() });
+        }
+
+        let window_event =
+            WindowEvent::KeyboardInput { device_id: DEVICE_ID, event: key_event, is_synthetic };
+
+        self.queue_event(window_event);
+    }
+
+    /// Start a new serial for the current keyDown/keyUp pair.
+    ///
+    /// We use this to correlate raw-character events with IME handling within the same runloop
+    /// tick.
+    fn begin_key_event(&self) {
+        let next = self.ivars().current_event_serial.get().wrapping_add(1);
+        self.ivars().current_event_serial.set(next);
+    }
+
+    /// Let IME observe the native NSEvent via `NSTextInputContext::handleEvent` and record the
+    /// serial.
+    ///
+    /// Returns true when the IME consumed the event; in that case we should suppress raw character
+    /// delivery.
+    fn handle_text_input_event(&self, event: &NSEvent) -> bool {
+        let Some(input_context) = self.inputContext() else {
+            return false;
+        };
+
+        // Record which serial was seen by the IME so `drop_conflicting_raw_characters` knows what
+        // to cancel.
+        let serial = self.ivars().current_event_serial.get();
+        self.ivars().last_handled_event_serial.set(serial);
+
+        unsafe { input_context.handleEvent(event) }
+    }
+
+    /// Remove the most relevant queued raw-character entry when an IME commit occurs.
+    ///
+    /// This helps track that we've processed this character through IME and prevents
+    /// confusion in the insertText logic.
+    fn drop_conflicting_raw_characters(&self, _commit: &str) {
+        let serial = self.ivars().last_handled_event_serial.get();
+        let mut pending = self.ivars().pending_raw_characters.borrow_mut();
+
+        // Remove entries matching the current serial.
+        pending.retain(|entry| entry.serial != serial);
     }
 }
 
